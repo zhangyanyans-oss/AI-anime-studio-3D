@@ -922,8 +922,9 @@ def _visible_character_names(plot: dict) -> list[str] | None:
 
 
 def _facing_relative_to_camera(pf: float, vx: float, vy: float, dist: float, cam_rad: float) -> str:
-    """把人物在图纸上的朝向（0=图纸上方、顺时针）换算成生图模型听得懂的镜头相对朝向：
-    面向镜头 / 背对镜头 / 侧对镜头（面朝画面左或右）。"""
+    """把人物在图纸上的朝向（0=图纸上方、顺时针）换算成生图模型听得懂的镜头相对朝向。
+    六档量化（阈值按与机位视线夹角）：正面 / 四分之三面向 / 侧面 / 四分之三背对 / 完全背对。
+    细档的意义：±60°内一律叫"面向镜头"时，实际已接近纯侧面的人物会被模型画成正脸——实测朝向不敏感的主因。"""
     import math
     if dist <= 1e-6:
         return "视角人物（镜头从他眼中拍出）"
@@ -931,14 +932,42 @@ def _facing_relative_to_camera(pf: float, vx: float, vy: float, dist: float, cam
     pfx, pfy = math.sin(prad), -math.cos(prad)  # 人物面朝方向（图纸坐标）
     to_cam = (-vx / dist, -vy / dist)           # 人物→机位方向（看向镜头的方向）
     dot = pfx * to_cam[0] + pfy * to_cam[1]
-    if dot >= 0.5:
-        return "面向镜头"
-    if dot <= -0.5:
-        return "背对镜头"
+    if dot >= 0.82:      # 与视线夹角 ≤ 约35°
+        return "正面对镜头（正脸朝向观众，脸完整可见）"
+    if dot >= 0.45:      # 约35°~63°
+        return "四分之三面向镜头（斜侧身，脸大部分朝向观众、双眼可见）"
+    if dot <= -0.82:     # 背离视线 ≤ 约35°
+        return "完全背对镜头（只见后脑勺与后背，脸完全不可见）"
+    if dot <= -0.45:     # 背离视线 约35°~63°
+        return "四分之三背对镜头（大半背影，脸部几乎不可见）"
     # 侧对：机位视线右侧在图纸上的方向向量（rad=0 朝上拍时=图纸右方 (1,0)）
     rx, ry = math.cos(cam_rad), math.sin(cam_rad)
     side_dot = pfx * rx + pfy * ry
-    return "侧对镜头、面朝画面右" if side_dot > 0 else "侧对镜头、面朝画面左"
+    return "侧对镜头、面朝画面右（观众看到其右侧脸）" if side_dot > 0 else "侧对镜头、面朝画面左（观众看到其左侧脸）"
+
+
+_FACING_VISUAL_RULE = [
+    # (识别子串, 给生图模型的硬性视觉要求)  顺序敏感：先长串后短串
+    ("完全背对镜头", "画面中只能出现其后脑勺与后背，严禁画出他的脸、正脸或侧脸"),
+    ("四分之三背对镜头", "画面以背影为主，脸部几乎不可见，严禁画出正脸"),
+    ("正面对镜头", "必须画出正脸、双眼朝向观众"),
+    ("四分之三面向镜头", "画成斜侧身，脸大部分朝向观众、双眼可见"),
+    ("侧对镜头", "画成侧面剪影，按写明的画面左右只露出对应的侧脸"),
+]
+
+
+def _facing_rule_text(facing_desc: str) -> str:
+    """朝向描述 → 对应的硬性视觉要求短语（提示词里逐人跟在朝向后，压权重）。"""
+    for key, rule in _FACING_VISUAL_RULE:
+        if key in facing_desc:
+            return rule
+    return "按写明的朝向执行"
+
+
+def _facing_brief(desc: str) -> str:
+    """朝向描述去掉括号内补充说明（硬约束行里已有视觉要求，避免双重括号重复）。"""
+    i = desc.find("（")
+    return desc[:i] if i > 0 else desc
 
 
 def format_plot_to_prompt(plot: dict, dynamic: bool = False) -> str:
@@ -975,6 +1004,9 @@ def format_plot_to_prompt(plot: dict, dynamic: bool = False) -> str:
         lines.append(title + "（本名单中的「画面左/右」＝成片图像里观众看到的左/右，"
                      "已按机位朝向换算，与图纸方位无关）" + "；".join(seg) + "。"
                      "「画面大小约为最近者的X%」由程序按沿视线方向的真实深度透视换算：百分比相同的人在画面中画成一样大，相差≥20%时大小差异必须明显可辨。")
+        # 朝向单独成行、逐人硬约束（与 AI 镜头解读的强化保持一致；兜底路径同样不能弱）
+        fr = "；".join(f"{c['name']}＝{_facing_brief(c['facing_desc'])}（{_facing_rule_text(c['facing_desc'])}）" for c in facts["visible"])
+        lines.append("【人物朝向·逐人硬约束】" + fr + "。朝向是权威事实，与任何文字描述冲突时以本条为准。")
     else:
         lines.append("【人物站位】机位前方视野内没有人物，画面以环境空镜为主。")
     hidden = facts["hidden"]
@@ -998,16 +1030,16 @@ def format_plot_to_prompt(plot: dict, dynamic: bool = False) -> str:
                      "以上两个名单描述的都是0秒初始画面的状态，不约束后续：初始在画面里的人物按上述站位出现；"
                      "初始不在画面的人物，若走位或镜头运动使其进入机位视野，则按真实透视自然走入画面（入画的就是本人，从画面边缘进来），"
                      "始终未进入视野的则全程不得出现、严禁凭空冒出。人物进出场只以走位与镜头运动为准。"
-                     "每个人物的身体朝向按名单描述执行（面向镜头＝正脸朝观众，背对镜头＝只见背影，侧对镜头＝按写明的画面左右侧脸）。"
+                     "每个人物的身体朝向按名单描述逐人严格执行：正面对镜头＝正脸朝向观众；四分之三面向镜头＝斜侧身、脸大部分朝向观众；侧对镜头＝只露写明的那一侧侧脸；四分之三背对镜头＝大半背影、脸部几乎不可见；完全背对镜头＝只见后脑勺与后背、严禁画出脸。"
                      "每个角色在画面中只出现一次、只有一个身体：走位描述的是同一角色的位移，严禁画成分身、复制人或两个同名角色；"
                      "俯视调度图纸/轨迹图类参考图仅用于确定站位与走位，严禁把图纸、人偶棋子图标、扇形视锥画进画面。")
     else:
         lines.append("【透视规则】离机位越近的人画面里越大（可为前景，可能只露腿部/肩膀/背影），越远越小、靠近地平线；"
                      "同一地面人物身高一致，纵深相近者大小相近。"
-                     "每个人物的身体朝向以上述描述为准（面向镜头＝正脸朝观众，背对镜头＝只见背影，侧对镜头＝按写明的画面左右侧脸），"
+                     "每个人物的身体朝向以上述描述为准、逐人严格执行：正面对镜头＝正脸朝向观众；四分之三面向镜头＝斜侧身、脸大部分朝向观众；侧对镜头＝只露写明的那一侧侧脸；四分之三背对镜头＝大半背影、脸部几乎不可见；完全背对镜头＝只见后脑勺与后背、严禁画出脸。"
                      "文字提示词中的朝向描述（如'面朝XX方向''看画面的对侧''望向XX'）若与本名单冲突，一律作废、按本名单执行。"
                      "镜头就是对准入画名单里的人拍的：离镜头最近的主体应按景别呈现在镜头前方（构图围绕该主体），"
-                     "写'面向镜头'的主体必须正脸朝向镜头，严禁把他挪到画面边缘、画成侧脸、或把画面取成顺着他视线望出去的方向。"
+                     "写'正面对镜头/四分之三面向镜头'的主体必须让脸朝向观众，严禁把他挪到画面边缘、画成背身、或把画面取成顺着他视线望出去的方向。"
                      "上面两个名单由程序按坐标计算，是权威事实："
                      "绝不入画名单里的人禁止出现在画面中，即使文字提示词提到了他们。"
                      "每个角色在画面中只出现一次、只有一个身体：走位描述的是同一角色的位移，严禁画成分身、复制人或两个同名角色；"
@@ -1112,7 +1144,7 @@ SHOT_TRANSLATE_SYSTEM_PROMPT = """你是资深摄影指导兼镜头翻译官。�
 几何事实是权威，不可更改：谁入画谁不入画、近远次序、大小百分比、画面左右、身体朝向一律照抄，禁止用你的直觉重算或调换。
 你只做"画面语言化"——把事实翻译成文生图/图生视频模型听得懂的画面描述：
 1. shot：按画面描述推断景别（特写/近景/中景/全景/远景）、机位高度（平拍/微俯/微仰）、一句话构图。
-2. characters：给每个入画人物写 frame_position（按 depth_rank：最近者"画面下缘/前景"，最远者"画面上缘地平线/远景深处"，中间者"画面纵深中部"，再叠加 frame_side 的左右）、depth_label（前景/中景/背景）、occlusion（按坐标间距判断谁可能被谁部分遮挡，没有就空串）、spacing（与其他人物的间距语义，如"与小美并排、间隔约一步""独自远离人群半个画面"）、presentation（结合画面描述写这个人物在镜头里的一句话呈现：姿势/在做什么/情绪，服从画面描述，不新增剧情）。
+2. characters：给每个入画人物写 frame_position（按 depth_rank：最近者"画面下缘/前景"，最远者"画面上缘地平线/远景深处"，中间者"画面纵深中部"，再叠加 frame_side 的左右）、depth_label（前景/中景/背景）、occlusion（按坐标间距判断谁可能被谁部分遮挡，没有就空串）、spacing（与其他人物的间距语义，如"与小美并排、间隔约一步""独自远离人群半个画面"）、presentation（结合画面描述写这个人物在镜头里的一句话呈现：姿势/在做什么/情绪，服从画面描述，不新增剧情；并把该人物的 facing 落成具体可视描述写进 presentation，例如"背对镜头"→"只见后脑勺与背影"、"侧对镜头"→"侧脸朝向画面右"）。
 3. excluded：照抄 hidden 名单与理由。
 4. layout_summary：整幅画面布局一句话（谁前谁后、谁大谁小、谁在哪一侧、画面主体是谁）。
 5. 若提供了运动轨迹（dynamic=true 时），在 presentation 里补一句该人物初始帧之后的运动意向（走位方向、靠近/远离镜头），并在 layout_summary 里补镜头运动（若有）。
@@ -1122,7 +1154,7 @@ SHOT_TRANSLATE_SYSTEM_PROMPT = """你是资深摄影指导兼镜头翻译官。�
  "characters":[{"name":"...","in_frame":true,"frame_position":"...","depth_label":"前景/中景/背景","size_percent":100,"frame_side":"照抄","facing":"照抄","occlusion":"","spacing":"","presentation":""}],
  "excluded":[{"name":"...","reason":"照抄"}],
  "layout_summary":"..."}
-size_percent 与 frame_side、facing 必须与输入事实逐字一致。"""
+size_percent 与 frame_side、facing 必须与输入事实逐字一致。facing 是硬性视觉约束：写"完全背对镜头"的人画面里绝不能出现他的脸（只能后脑勺与背影）；写"正面对镜头"的人必须正脸朝观众。"""
 
 
 async def synthesize_shot_brief(plot: dict, scene_desc: str, dynamic: bool) -> dict | None:
@@ -1135,7 +1167,7 @@ async def synthesize_shot_brief(plot: dict, scene_desc: str, dynamic: bool) -> d
         return None
     try:
         key = hashlib.sha1(json.dumps(
-            {"plot": plot, "desc": (scene_desc or "")[:500], "dyn": bool(dynamic), "v": 1},
+            {"plot": plot, "desc": (scene_desc or "")[:500], "dyn": bool(dynamic), "v": 2},
             sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
     except Exception:
         return None
@@ -1290,6 +1322,9 @@ def render_shot_brief_text(brief: dict) -> str:
                 parts.append(c["presentation"])
             seg.append(f"{c['name']}（" + "、".join(p for p in parts if p) + "）")
         lines.append("入画名单（从近到远）：" + "；".join(seg) + "。")
+        # 朝向单独成行、逐人给出硬性视觉要求——埋在括号列表里权重太低，模型实测会忽略
+        fr = "；".join(f"{c['name']}＝{_facing_brief(c['facing'])}（{_facing_rule_text(c['facing'])}）" for c in chars)
+        lines.append("【人物朝向·逐人硬约束】" + fr + "。朝向是权威事实，与任何文字描述冲突时以本条为准。")
     excluded = brief.get("excluded") or []
     if excluded:
         lines.append("绝不入画：" + "；".join(f"{c['name']}（{c['reason']}）" for c in excluded) + "。")
@@ -1706,7 +1741,7 @@ STAGING_SYSTEM_PROMPT = """你是场面调度解读员。导演给了一个镜�
    - 离机位近 → 离镜头近 → 画面中显得大、位于画面下缘，可能部分遮挡别人或被取景框裁切（紧挨机位的人可能只露出腿部/肩膀，按真实视野处理）；
    - 离机位远 → 显得小、靠近画面上缘地平线。
    分寸提示：从分镜描述中识别该镜头的景别与画面主体——主体按景别呈现，但主体同样站在调度图给他安排的位置上取景（不要把主体搬到前景）；其余人物的大小由与镜头的真实距离按透视自然形成，身高一致、纵深相近者大小相近，严禁画成巨人或小矮人；相对远近次序不变，与谁在做什么、谁是主角无关。
-3. 左右关系按"站在机位处朝拍摄方向看去"的左右为准；每人朝向必须照抄机位视野事实里的结论（面向镜头＝正脸朝观众、背对镜头＝只见背影、侧对镜头＝按写明的画面左右侧脸），口述里"面朝某人方向"之类的描述只用来理解剧情，与事实冲突时不得写进 brief。
+3. 左右关系按"站在机位处朝拍摄方向看去"的左右为准；每人朝向必须照抄机位视野事实里的结论（正面对镜头＝正脸朝观众、四分之三面向镜头＝斜侧身脸大部分可见、侧对镜头＝按写明的画面左右侧脸、四分之三背对镜头＝大半背影脸几乎不可见、完全背对镜头＝只见背影严禁画脸），口述里"面朝某人方向"之类的描述只用来理解剧情，与事实冲突时不得写进 brief。
 4. 写明明显的前后遮挡关系（谁在谁前面）。
 5. 必须写明人物之间的相对间距，保持口述中的比例：谁和谁挨得近（如"小美就在小帅右侧两三步处，两人几乎并排""三人扎堆围在栅栏边"）、谁离人群远（如"瘦猴独自在角落，与人群隔半个画面"）。相近的人在画面中也应相邻、允许互相部分遮挡；不要把人物均匀散布在画面里。
 6. 若有移动轨迹，写明从起点纵深到终点纵深的变化（如"从远景跑向近景，逐渐变大"）。
@@ -1891,10 +1926,10 @@ def select_relevant_references(pool: list[str], meta: list[Dict[str, Any]] | Non
             data = deepseek_json(response)
             picked = [int(i) for i in data.get("indices", []) if isinstance(i, (int, str)) and str(i).lstrip("-").isdigit()]
             picked = [i for i in picked if 0 <= i < len(pool)]
-            # 去重保序，角色优先排序
+            # 去重保序，角色优先排序（融脸照片跟随其角色，视同角色优先级）
             seen = set()
             ordered = []
-            for i in sorted(set(picked), key=lambda x: (0 if (meta[x].get("kind") if x < len(meta) else "") == "character" else 1, x)):
+            for i in sorted(set(picked), key=lambda x: (0 if (meta[x].get("kind") if x < len(meta) else "") in ("character", "face") else 1, x)):
                 if i not in seen:
                     seen.add(i); ordered.append(i)
             if ordered:
@@ -2013,10 +2048,10 @@ async def generate_image(req: ImageRequest):
                 m = metas[i] if i < len(metas) else {}
                 kind = str(m.get("kind") or "")
                 name = str(m.get("name") or "").strip()
-                if empty_shot and kind in ("character", "prop"):
+                if empty_shot and kind in ("character", "prop", "face"):
                     removed.append(f"{name or kind}（空镜）")
                     continue
-                if kind == "character" and allowed is not None and name and name not in allowed:
+                if kind in ("character", "face") and allowed is not None and name and name not in allowed:
                     removed.append(name)
                     continue
                 f_pool.append(pool[i]); f_meta.append(m)
@@ -2026,6 +2061,26 @@ async def generate_image(req: ImageRequest):
                            + (f"；保留入画角色：{'、'.join(vis_names) or '无'}" if allowed is not None else ""))
             pool, metas = f_pool, f_meta
         picked = select_relevant_references(pool, metas, context)
+        # 容错：项目搬运/换电脑后 static/uploads 里可能没有旧参考图文件（此前会报
+        # "参考图文件不存在"直接炸掉整个生图）。缺失的参考图跳过、不阻断生成，
+        # 丢失名单随响应带回前端提示；用户重新上传对应参考图即可恢复一致性。
+        # 注意必须在 picked 上剔除（而不是在 resolved 里跳过）——后面 n_diag/指令注入
+        # 都按 picked 索引数 meta，剔除后张数才不会错位。
+        _KIND_LABEL = {"character": "角色", "scene": "场景", "prop": "道具", "diagram": "调度图", "face": "融脸照片"}
+        missing_refs = []
+        _kept = []
+        for i in picked:
+            u = pool[i]
+            if u.startswith(("http://127.0.0.1", "http://localhost", "/static/")) and local_static_path(u) is None:
+                m = metas[i] if i < len(metas) else {}
+                label = str(m.get("name") or "").strip()
+                kind = _KIND_LABEL.get(str(m.get("kind") or ""), "")
+                missing_refs.append(f"{kind}「{label}」" if label else u.split("/")[-1])
+                continue
+            _kept.append(i)
+        picked = _kept
+        if missing_refs:
+            print(f"⚠️ 跳过 {len(missing_refs)} 张丢失的参考图（继续生成）: {missing_refs}")
         resolved = []
         for i in picked:
             u = pool[i]
@@ -2033,7 +2088,8 @@ async def generate_image(req: ImageRequest):
                 resolved.append(local_url_to_data_uri(u))
             else:
                 resolved.append(u)
-        payload["image"] = resolved[:MAX_REF_IMAGES]  # 最终安全上限
+        if resolved:
+            payload["image"] = resolved[:MAX_REF_IMAGES]  # 最终安全上限
 
         # 调度图（俯视走位/运动轨迹）是导演定稿，优先级高于文字提示词：
         # 注入强制约束，让构图布局以调度图为准，文字只负责画风/长相/服装/细节
@@ -2099,8 +2155,9 @@ async def generate_image(req: ImageRequest):
                 "【结尾重申·最高优先级】请逐条核对后再出图：①镜头位置与朝向只由「机位」符号决定；"
                 "②画面中出现的人物必须且只能是入画名单里的人，绝不入画名单里的人一个都不能出现；"
                 "③人物远近与大小按入画名单从近到远按透视排列；"
-                "④若存在【导演落位指令】，被指定人物在画面中的落位按导演指定执行；"
-                "⑤最终输出正常视角的真实镜头画面，不是俯视图或示意图。\n"
+                "④人物身体朝向逐人核对：写「正面对镜头」的必须正脸朝观众，写「完全背对镜头」的只能画背影、画面里严禁出现他的脸，写「侧对镜头」的只露写明那一侧的侧脸；"
+                "⑤若存在【导演落位指令】，被指定人物在画面中的落位按导演指定执行；"
+                "⑥最终输出正常视角的真实镜头画面，不是俯视图或示意图。\n"
             )
             # 🌟 强指令放到 prompt 末尾：大模型对末尾指令的服从度最高，放开头容易被当背景介绍忽略
             payload["prompt"] = payload["prompt"] + "\n\n" + directive
@@ -2129,6 +2186,24 @@ async def generate_image(req: ImageRequest):
             )
             payload["prompt"] = payload["prompt"] + "\n\n" + anchor_txt
             log_prompt("角色外貌锚点注入", "\n".join(anchor_lines), "")
+
+        # 照片融脸：参考图里 kind=face 的是角色真实面部照片。picked 顺序与 payload["image"] 一一对应，
+        # 按最终发送序号指明哪张是融脸照，并把"面部相似度"写成最高优先级指令（放在 prompt 末尾服从度最高）
+        face_notes = []
+        for k, i in enumerate(picked):
+            if i < len(metas) and str(metas[i].get("kind") or "") == "face":
+                nm = str(metas[i].get("name") or "").strip() or "对应角色"
+                face_notes.append(f"第{k + 1}张参考图是角色「{nm}」的真实人物面部照片")
+        if face_notes:
+            face_txt = (
+                "【融脸指令·面部相似度最高优先级】" + "；".join(face_notes) + "。"
+                "生成画面中该角色的脸型、五官、面部特征必须与照片中人物高度相似（把照片中的脸融进画面角色）；"
+                "脸型与五官以融脸照片为准（优先于外貌锚点与文字提示词中的面部描述），"
+                "发型、发色、服装、体型、画风仍按角色设定图与提示词执行。照片仅取面部特征——"
+                "严禁把照片中的真实背景、衣着、光线构图画进画面，严禁把画面画成真人照片写实风格（画风仍按本条提示词）。"
+            )
+            payload["prompt"] = payload["prompt"] + "\n\n" + face_txt
+            log_prompt("融脸指令注入", "；".join(face_notes), "")
 
     headers = {
         "Authorization": f"Bearer {DOUBAO_API_KEY}",
@@ -2165,7 +2240,14 @@ async def generate_image(req: ImageRequest):
         with open(filepath, "wb") as f:
             f.write(img_bytes)
 
-        return {"image_url": f"/static/uploads/{filename}"}
+        result = {"image_url": f"/static/uploads/{filename}"}
+        if missing_refs:
+            result["warnings"] = (
+                f"已跳过 {len(missing_refs)} 张丢失的参考图（文件不在 static/uploads，多半是换电脑/搬项目时没拷 uploads 目录）："
+                + "、".join(missing_refs)
+                + "。本次已继续生成，但涉及的角色/场景/道具长相可能与之前不一致；到对应角色/场景/道具卡片重新上传参考图即可恢复。"
+            )
+        return result
 
 class UploadImageRequest(BaseModel):
     image_base64: str  # data URI 或纯 base64
@@ -2464,6 +2546,15 @@ async def extract_file(file: UploadFile = File(...)):
     return {"name": name, "text": text, "chars": len(text)}
 
 # ---------- 4. AutoDL 提交视频任务 ----------
+def local_static_path(url: str | None) -> str | None:
+    """把本地图床 URL 解析成磁盘路径；文件不存在返回 None（供容错判断，
+    项目搬运/换电脑时 static/uploads 可能没跟着拷，旧参考图 URL 会指向不存在的文件）"""
+    if not url or "/static/" not in url:
+        return None
+    path_part = url.split("/static/")[-1].split("?")[0]
+    p = os.path.join("static", path_part)
+    return p if os.path.exists(p) else None
+
 def local_url_to_data_uri(url: str) -> str:
     """把本地图床 URL 转成 base64 data URI。
     AutoDL 云端无法访问本机 127.0.0.1 地址；实测 minimax_h3_zm 系列工作流
@@ -2546,6 +2637,21 @@ async def generate_video(req: VideoRequest):
         frame_mode = "first_last"
     else:
         frame_mode = "reference"
+
+    # 容错：参考图模式过滤掉磁盘上已丢失的本地图（项目搬运/换电脑没拷 uploads）。
+    # 此前会报"参考图文件不存在"直接 404 炸掉提交；现在跳过并随响应提示，
+    # 用户重新上传参考图即可恢复一致性。首/尾帧是工作流必填项，缺失仍报错。
+    missing_video_refs: list[str] = []
+    if frame_mode == "reference":
+        _kept_urls, _rest = [], list(req.image_urls or [])
+        for u in _rest[:9]:
+            if "/static/" in u and local_static_path(u) is None:
+                missing_video_refs.append(u.split("/")[-1])
+                continue
+            _kept_urls.append(u)
+        if missing_video_refs:
+            print(f"⚠️ 跳过 {len(missing_video_refs)} 张丢失的视频参考图（继续提交）: {missing_video_refs}")
+            req.image_urls = _kept_urls + _rest[9:]
 
     # 运动轨迹指令：调度图纸（俯视/轨迹）坐标翻译成自然语言，与参考图一起约束视频的人物走位与镜头运动
     prompt = req.prompt
@@ -2770,17 +2876,23 @@ async def generate_video(req: VideoRequest):
         if not task_id:
             raise HTTPException(500, f"未拿到 task_id：{data}")
         result = {"task_id": task_id, "raw": data}
+        if missing_video_refs:
+            result["warning"] = (
+                f"已跳过 {len(missing_video_refs)} 张丢失的参考图（文件不在 static/uploads，多半是换电脑/搬项目时没拷 uploads 目录）："
+                + "、".join(missing_video_refs)
+                + "。任务已照常提交，但涉及的角色/场景可能与之前不一致；重新上传参考图可恢复。"
+            )
         # 首尾帧差异预检：构图差异过大是中间帧崩坏（背景塌白/人物突变/硬切）的高发因素
         if frame_mode == "first_last" and req.first_frame_url and req.last_frame_url:
             div = await asyncio.to_thread(_frame_divergence, req.first_frame_url, req.last_frame_url)
             if div is not None:
                 print(f"📊 首尾帧构图差异: {div:.3f}")
                 if div >= 0.30:
-                    result["warning"] = (f"首尾帧构图差异过大（{div:.0%}，相当于镜头大幅跨越）：中间过程极易崩坏"
+                    result["warning"] = (result.get("warning") or "") + (f"首尾帧构图差异过大（{div:.0%}，相当于镜头大幅跨越）：中间过程极易崩坏"
                                          f"（背景消失、人物突变、硬切）。强烈建议拆成两镜接拍：先拍从首帧到中间状态，"
                                          f"再用「🎬 接拍下一镜」从尾帧接拍剩余动作。")
                 elif div >= 0.15:
-                    result["warning"] = (f"首尾帧构图差异较大（{div:.0%}）：中间过程可能出现不自然过渡。"
+                    result["warning"] = (result.get("warning") or "") + (f"首尾帧构图差异较大（{div:.0%}）：中间过程可能出现不自然过渡。"
                                          f"若生成结果有跳变，建议把运镜描述写进提示词（如\"镜头缓缓推近\"），或拆成两镜接拍。")
         return result
 

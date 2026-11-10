@@ -232,6 +232,7 @@
                     <input type="file" id="sbImageUploadInput" accept="image/*" onchange="handleSbImageUpload(event)" style="display:none;">
                     <input type="file" id="diagramUploadInput" accept="image/*" onchange="handleDiagramUpload(event)" style="display:none;">
                     <input type="file" id="refImageUploadInput" accept="image/*" onchange="handleRefImageUpload(event)" style="display:none;">
+                    <input type="file" id="faceImageUploadInput" accept="image/*" multiple onchange="handleFaceImageUpload(event)" style="display:none;">
                     <label for="mainImageInput" class="label-upload">📎 传图</label>
                 </div>
                 <span id="storyStatus" class="hint"></span>
@@ -352,10 +353,11 @@
         <div id="viewDirector" class="side-view hidden">
             <div class="side-view-inner" style="max-width:1200px;">
                 <h2 style="margin-bottom:4px;">🎬 3D 导演台</h2>
-                <div class="hint" style="display:block;">把调度图坐标变成 3D 场景：<b>左键</b>拖人物/机位/道具/轨迹拐点（松手自动同步回平面图纸与坐标），<b>拖红色手柄</b>转朝向，<b>右键</b>平移视角、<b>滚轮</b>缩放；右下角<b>机位预览</b>实时显示成片构图——谁近谁远、谁被遮挡，开拍前用眼睛确认。</div>
+                <div class="hint" style="display:block;">把调度图坐标变成 3D 场景：<b>左键</b>拖人物/机位/道具/轨迹拐点（松手自动同步回平面图纸与坐标），<b>拖红色手柄</b>转朝向，<b>右键</b>平移视角、<b>滚轮</b>缩放；右下角<b>机位预览</b>实时显示成片构图——谁近谁远、谁被遮挡，开拍前用眼睛确认；预览窗挡住场景时，点右上角「🎥 预览窗」按钮可随时关掉。</div>
                 <div style="margin-top:14px; display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
                     <label style="font-size:13px; font-weight:600;">选择分镜：</label>
                     <select id="dir3dShotSelect" onchange="mountDirectorTab()" style="padding:6px 10px; border:1px solid var(--border-color); border-radius:8px; max-width:420px;"></select>
+                    <button class="btn-sm btn-ghost" onclick="backToDiagram()" title="回到创作页，定位并高亮当前分镜的调度图">🗺️ 返回调度图</button>
                     <span id="dir3dTabHint" class="hint" style="display:inline;"></span>
                 </div>
                 <div id="dir3d-tab-container" style="margin-top:12px;"></div>
@@ -1026,8 +1028,14 @@
                 // 候选参考：全部角色图 + 全部场景图 + 全部道具图（带元数据），由后端按分镜内容智能筛选相关的。
                 // 角色元数据带的是"外貌权威"：重写/识图后的最新版（后端会作为外貌锚点注入生图指令，压过分镜提示词里的旧外貌）
                 (currentData.storyData.characters || []).forEach((c, i) => addRef(c.imgSrc || currentData.images[`char-${i}`], "character", c.name, c.edited_prompt || c.image_prompt || c.description));
+                // 融脸照片：角色有真实面部照片时自动跟随角色参考图发出（kind=face，后端注入融脸指令）
+                (currentData.storyData.characters || []).forEach(c => (c.faceImgs || []).forEach(fu => addRef(fu, "face", c.name, "该角色的真实面部照片，用于融脸")));
                 (currentData.storyData.scenes || []).forEach((s, i) => addRef(s.imgSrc || currentData.images[`scene-${i}`], "scene", s.name, s.description));
                 addPropRefs();
+            } else if (type === 'char') {
+                // 角色重新生成：自动携带融脸照片（把真实面部特征融进生成的设定图；设定图本身不发，避免自我参考）
+                const cItem = (currentData.storyData.characters || [])[indexOrId];
+                (cItem ? (cItem.faceImgs || []) : []).forEach(fu => addRef(fu, "face", cItem.name || "", "该角色的真实面部照片，用于融脸"));
             } else if (type === 'scene') {
                 // 场景设定图是空镜（规范：画面中无人物）：不发角色参考图——
                 // 生图模型看到角色参考图就会把人画进空镜，提示词写"无人物"也拗不过参考图；
@@ -1087,7 +1095,11 @@
                     throw new Error(detail);
                 }
                 const data = await resp.json();
-                
+                if (data.warnings) {
+                    // 参考图文件丢失（如换电脑没拷 uploads）：不阻断生成，但提示哪些参考没带上
+                    alert("⚠️ 参考图提示\n\n" + data.warnings);
+                }
+
                 // 后端已返回 URL，直接拼接主机名
                 const imgSrc = window.location.origin + data.image_url;
                 
@@ -1225,6 +1237,57 @@
                 }
             };
             reader.readAsDataURL(file);
+        }
+
+        // ================= 角色「🧬 融脸」：上传真实人物面部照片（可多选），生成时自动把照片中的脸融进该角色 =================
+        let faceTargetChar = null;
+        function uploadFaceImage(index) {
+            faceTargetChar = index;
+            const input = document.getElementById("faceImageUploadInput");
+            input.value = "";
+            input.click();
+        }
+        async function handleFaceImageUpload(ev) {
+            const files = Array.from(ev.target.files || []);
+            if (!files.length || faceTargetChar == null) return;
+            const index = faceTargetChar;
+            const item = (currentData.storyData.characters || [])[index];
+            if (!item) return;
+            try {
+                const urls = [];
+                for (const file of files) {
+                    const b64 = await new Promise((res, rej) => {
+                        const r = new FileReader();
+                        r.onload = () => res(r.result);
+                        r.onerror = () => rej(new Error("读取文件失败"));
+                        r.readAsDataURL(file);
+                    });
+                    const resp = await fetch(`${API}/api/upload-image`, {
+                        method: "POST", headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ image_base64: b64, filename: file.name }),
+                    });
+                    if (!resp.ok) {
+                        const err = await resp.json().catch(() => ({}));
+                        throw new Error(err.detail || "上传失败");
+                    }
+                    const data = await resp.json();
+                    urls.push(window.location.origin + data.image_url);
+                }
+                item.faceImgs = [...(item.faceImgs || []), ...urls];
+                saveCurrentProject();
+                renderStory(currentData.storyData, true);
+            } catch (e) {
+                alert(`融脸照片上传失败: ${e.message}`);
+            }
+        }
+
+        // 移除角色的某张融脸照片（缩略图上的 × ）
+        function removeFaceImg(charIndex, faceIndex) {
+            const c = (currentData.storyData.characters || [])[charIndex];
+            if (!c || !Array.isArray(c.faceImgs) || !c.faceImgs[faceIndex]) return;
+            c.faceImgs.splice(faceIndex, 1);
+            saveCurrentProject();
+            renderStory(currentData.storyData, true);
         }
 
         // 从参考图反推文字描述（DeepSeek 识图）。手动点按钮=明确要覆盖；自动（silent）只在描述为空时被调
@@ -1502,6 +1565,27 @@
             if (vd && !vd.classList.contains("hidden")) mountDirectorTab();
         };
         window.addEventListener("director3d-ready", mountDirector3D);
+
+        // 从调度图「🎬 进入导演台」按钮：切到导演台标签页并预选该分镜
+        function openDirectorTab(sbId) {
+            if (!sbById(sbId)) return;
+            window._dir3dPreselect = sbId;
+            showTab("director"); // mountDirectorTab 会消费 _dir3dPreselect 并选中该分镜
+        }
+        // 从导演台「🗺️ 返回调度图」按钮：回到创作页，滚动定位并短暂高亮该分镜的调度图面板
+        function backToDiagram() {
+            const sel = document.getElementById("dir3dShotSelect");
+            const sbId = sel ? sel.value : null;
+            showTab("create");
+            if (!sbId) return;
+            const panel = document.getElementById("diag-panel-" + sbId);
+            if (!panel) return;
+            panel.scrollIntoView({ behavior: "smooth", block: "center" });
+            panel.style.transition = "box-shadow .35s";
+            panel.style.boxShadow = "0 0 0 3px rgba(245,158,11,.85)";
+            clearTimeout(panel._flashTimer);
+            panel._flashTimer = setTimeout(() => { panel.style.boxShadow = ""; }, 1800);
+        }
 
         function toggleDiagramDrag(sbId, kind) {
             const key = sbId + ":" + kind;
@@ -1894,14 +1978,15 @@
                 window.Director3D && window.Director3D.closeAll();
                 return;
             }
-            // 保持已选中的分镜；没有则默认选第一个
-            const prevId = sel.value;
+            // 保持已选中的分镜；调度图「进入导演台」按钮带来 _dir3dPreselect；都没有则默认选第一个
+            const wanted = window._dir3dPreselect || sel.value;
+            window._dir3dPreselect = null;
             sel.innerHTML = sbs.map(x => {
                 const sb = x.sb, plot = sb.trajViewPlot || sb.topViewPlot;
                 const nChar = (plot.characters || []).length;
                 return `<option value="${sb._id}">#${x.n} 分镜（${nChar} 人${sb.duration ? " · " + sb.duration + "s" : ""}）</option>`;
             }).join("");
-            sel.value = sbs.some(x => x.sb._id === prevId) ? prevId : sbs[0].sb._id;
+            sel.value = sbs.some(x => x.sb._id === wanted) ? wanted : sbs[0].sb._id;
             const sb = sbs.find(x => x.sb._id === sel.value).sb;
             const kind = sb.trajViewPlot ? "trajectory" : "topview";
             const plot = sb[diagPlotKey(kind)];
@@ -2109,9 +2194,11 @@
                             <button class="btn-sm btn-ghost" id="cam-btn-${sb._id}" onclick="toggleCamMark('${sb._id}', this)" title="在俯视图上点击标注机位位置（远近与左右换算以标注机位为准）">${sb.topViewCam ? "📷 移动机位" : "📷 标机位"}</button>
                             ${sb.topViewCam ? `<button class="btn-sm btn-ghost" onclick="clearTopViewCam('${sb._id}')">🗑 清除机位</button>` : ""}
                             <button class="btn-sm btn-ghost" id="drag-btn-topview-${sb._id}" onclick="toggleDiagramDrag('${sb._id}', 'topview', this)" ${sb.topViewPlot ? "" : `disabled title="这张图没有坐标数据（可能是本地上传的图），无法拖拽"`} title="在图上直接拖动角色/机位/陈设，松手即重绘图纸（角色的运动轨迹会跟着一起平移）">✋ 拖拽编辑</button>
+                            <button class="btn-sm btn-ghost" onclick="openDirectorTab('${sb._id}')" ${(sb.trajViewPlot || sb.topViewPlot) ? "" : `disabled title="这个分镜还没有调度图坐标数据（先 AI 生成一张调度图）"`} title="跳到全屏 3D 导演台：拖拽人物/机位/道具、旋转朝向，实时预览成片构图；松手自动同步回这张图纸">🎬 进入导演台</button>
                         </div>` : ""}
                         ${url && !isTop ? `<div style="margin-top:4px; display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
                             <button class="btn-sm btn-ghost" id="drag-btn-trajectory-${sb._id}" onclick="toggleDiagramDrag('${sb._id}', 'trajectory', this)" ${sb.trajViewPlot ? "" : `disabled title="这张图没有坐标数据（可能是本地上传的图），无法拖拽"`} title="在图上直接拖动角色/轨迹拐点/机位，松手即重绘图纸">✋ 拖拽编辑</button>
+                            <button class="btn-sm btn-ghost" onclick="openDirectorTab('${sb._id}')" ${(sb.trajViewPlot || sb.topViewPlot) ? "" : `disabled title="这个分镜还没有调度图坐标数据（先 AI 生成一张调度图）"`} title="跳到全屏 3D 导演台：拖拽人物/机位/道具、旋转朝向，实时预览成片构图；松手自动同步回这张图纸">🎬 进入导演台</button>
                         </div>` : ""}
                         ${url ? `<label style="font-size:12px; display:flex; gap:4px; align-items:center; cursor:pointer; margin-top:6px;"><input type="checkbox" ${sb[useKey] !== false ? "checked" : ""} onchange="toggleDiagramUse('${sb._id}', '${kind}', this.checked)"> 生成视频时参考</label>` : ""}
                     `;
@@ -2155,7 +2242,7 @@
                         </div>
                         <div id="sb-au-${sb._id}" style="margin-top:6px;"></div>
                         <div class="image-slot" id="sb-img-${sb._id}" ${sb.images.length ? `data-image-url="${sb.images[0].url}"` : ''}>${galleryHtml}</div>
-                        <div style="margin-top:12px; padding:10px 12px; background:#fffbeb; border:1px dashed #fcd34d; border-radius:10px;">
+                        <div id="diag-panel-${sb._id}" style="margin-top:12px; padding:10px 12px; background:#fffbeb; border:1px dashed #fcd34d; border-radius:10px;">
                             <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
                                 <span style="font-size:13px; font-weight:600;">🗺️ 调度参考图</span>
                                 <span class="hint" style="display:inline; margin:0;">口述位置关系与轨迹 → AI 解析成坐标 → <b>程序精确绘制平面图纸</b>（非 AI 生图，永不跑偏）。图纸即<b>导演定稿</b>：规定人物位置关系、运动轨迹、机位（与文字提示词冲突时以此为准）；景别构图、画风长相仍按提示词。可画取景框/标机位，生成分镜图时自动最高优先级参考</span>
@@ -2245,9 +2332,17 @@
                     </div>
                     <div id="char-au-${i}" style="margin-top:6px;"></div>
                     <div class="image-slot" id="char-img-${i}" ${savedImg ? `data-image-url="${savedImg}"` : ''}>${savedImg ? `<img src="${savedImg}">` : ''}</div>
+                    ${(c.faceImgs || []).length ? `<div style="margin-top:6px; display:flex; gap:8px; flex-wrap:wrap; align-items:flex-start;">
+                        <span style="font-size:11px; color:#9ca3af; line-height:52px;">🧬 融脸照</span>
+                        ${c.faceImgs.map((u, fi) => `<span style="position:relative; display:inline-block;">
+                            <img src="${u}" style="width:52px; height:52px; object-fit:cover; border-radius:8px; border:1px solid var(--border-color);" title="融脸照片：生成时自动把这张脸的面部特征融进该角色">
+                            <button onclick="removeFaceImg(${i}, ${fi})" title="移除这张融脸照片" style="position:absolute; top:-7px; right:-7px; width:18px; height:18px; border-radius:50%; border:none; background:#ef4444; color:#fff; font-size:12px; line-height:16px; cursor:pointer; padding:0;">×</button>
+                        </span>`).join("")}
+                    </div>` : ""}
                     <div style="margin-top:12px; display:flex; flex-wrap:wrap; gap:10px;">
                         <button onclick="genImage('char', ${i})" style="flex:1;">${savedImg ? '重新生成' : '生成'}</button>
                         <button class="btn-download" onclick="uploadRefImage('char', ${i})" title="上传本地图片直接作为该角色的参考图（分镜图会参考它）">📁 传图</button>
+                        <button class="btn-download" onclick="uploadFaceImage(${i})" title="上传真实人物面部照片（可一次多选）：生成分镜图和角色图时，自动把照片中人物的脸型五官融进该角色，发型/服装/画风仍按设定图">🧬 融脸</button>
                         ${savedImg ? `<button class="btn-download" id="ref-analyze-char-${i}" onclick="extractRefDesc('char', ${i})" title="从参考图反推外貌描述与生图提示词">🔍 识图</button>` : ''}
                         ${savedImg ? `<button class="btn-download" onclick="downloadImage('${savedImg}', '角色_${escapeAttr(c.name || "角色")}.png')">📥 保存原图</button>` : ''}
                     </div>

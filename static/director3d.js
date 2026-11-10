@@ -17,6 +17,8 @@ const toWorldX = nx => (nx - 0.5) * WORLD;
 const toWorldZ = ny => (ny - 0.5) * WORLD;
 const toNormX = wx => Math.min(1, Math.max(0, wx / WORLD + 0.5));
 const toNormZ = wz => Math.min(1, Math.max(0, wz / WORLD + 0.5));
+// 必须放在模块顶层：applyDrag 是模块级函数，之前 clampW 被困在 open() 里，每次拖动都抛 ReferenceError，导致坐标永远更新不了
+const clampW = v => Math.min(WORLD / 2, Math.max(-WORLD / 2, v));
 const facingRad = deg => (deg || 0) * Math.PI / 180;          // 0=图纸上方(-z)，90=右(+x)
 const facingDir = deg => new THREE.Vector3(Math.sin(facingRad(deg)), 0, -Math.cos(facingRad(deg)));
 
@@ -310,13 +312,20 @@ function open(key, container, plot, palette, onCommit) {
     instances.set(key, inst);
 
     container.innerHTML = `
-        <div class="dir3d-wrap" style="position:relative; height:430px; border:1px solid var(--border-color); border-radius:10px; overflow:hidden; background:#0f172a;">
+        <div class="dir3d-wrap" style="position:relative; height:min(72vh, 760px); border:1px solid var(--border-color); border-radius:10px; overflow:hidden; background:#0f172a;">
             <div class="dir3d-hint" style="position:absolute; top:8px; left:10px; z-index:3; font-size:12px; color:#94a3b8; background:rgba(10,16,32,.72); padding:4px 10px; border-radius:8px; pointer-events:none;">
                 🖱️ 左键拖人物/机位/道具/红点（松手重绘图纸）· 右键平移 · 滚轮缩放 · 空白处左键旋转视角
             </div>
+            <button class="dir3d-pvbtn" title="开关右下角的机位预览窗，挡住场景时可关掉" style="position:absolute; top:8px; right:10px; z-index:4; font-size:12px; color:#e2e8f0; background:rgba(10,16,32,.72); border:1px solid rgba(148,163,184,.45); padding:4px 10px; border-radius:8px; cursor:pointer;">🎥 预览窗：开</button>
             <div class="dir3d-camlabel" style="position:absolute; right:14px; bottom:14px; z-index:3; font-size:12px; color:#fca5a5; background:rgba(10,16,32,.72); padding:3px 9px; border-radius:8px; pointer-events:none;">🎥 机位预览（成片构图）</div>
         </div>`;
     const wrap = container.firstElementChild;
+    inst.showPreview = true;
+    wrap.querySelector(".dir3d-pvbtn").addEventListener("click", () => {
+        inst.showPreview = !inst.showPreview;
+        wrap.querySelector(".dir3d-pvbtn").textContent = inst.showPreview ? "🎥 预览窗：开" : "🎥 预览窗：关";
+        resize();
+    });
 
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
@@ -345,6 +354,7 @@ function open(key, container, plot, palette, onCommit) {
     // 注意：必须先于 OrbitControls 注册——同一元素上的监听按注册顺序触发，
     // 这样命中可拖物体时我们先把 controls.enabled=false，OrbitControls 才不会同时转视角
     const raycaster = new THREE.Raycaster();
+    raycaster.layers.enable(1);   // 轨迹拐点/机位轨迹红点在 layer1（仅导演视角显示），不开启就永远点不到
     const pointer = new THREE.Vector2();
     const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
     let drag = null;
@@ -361,10 +371,17 @@ function open(key, container, plot, palette, onCommit) {
         const v = new THREE.Vector3();
         return raycaster.ray.intersectPlane(groundPlane, v) ? v : null;
     };
-    const clampW = v => Math.min(WORLD / 2, Math.max(-WORLD / 2, v));
 
     dom.addEventListener("pointerdown", e => {
         if (e.button !== 0) return; // 右/中键留给视角控制
+        // 预览窗区域不参与拾取：那里画的是机位视角，若按主视角射线去抓，
+        // 会抓到"被预览窗挡住的主视图物体"，出现看着 A 拖着 B 的错乱体验
+        {
+            const r = dom.getBoundingClientRect();
+            const px = e.clientX - r.left, py = e.clientY - r.top;
+            const [pw, ph] = pvWH();
+            if (pw > 40 && px >= (inst.viewW || 0) - pw - 10 && py >= (inst.viewH || 0) - ph - 10) return;
+        }
         setPointer(e);
         raycaster.setFromCamera(pointer, mainCam);
         const hits = raycaster.intersectObjects(inst.pickables, false);
@@ -409,6 +426,13 @@ function open(key, container, plot, palette, onCommit) {
     inst.controls = controls;
 
     // ---------- 尺寸自适应 + 渲染循环 ----------
+    // 预览窗固定 16:9、宽 30%（可开关），标签贴在预览窗上沿
+    const PV_RATIO = 0.30;
+    const pvWH = () => {
+        const w = inst.viewW || 0;
+        const pw = inst.showPreview ? Math.round(w * PV_RATIO) : 0;
+        return [pw, Math.round(pw * 9 / 16)];
+    };
     const resize = () => {
         const w = wrap.clientWidth, h = wrap.clientHeight;
         if (!w || !h) return;
@@ -416,10 +440,12 @@ function open(key, container, plot, palette, onCommit) {
         mainCam.aspect = w / h;
         mainCam.updateProjectionMatrix();
         inst.viewW = w; inst.viewH = h;
-        // 预览窗固定 16:9、宽 38%，标签贴在预览窗上沿
-        const pw = Math.round(w * 0.38), ph = Math.round(pw * 9 / 16);
+        const [pw, ph] = pvWH();
         const label = wrap.querySelector(".dir3d-camlabel");
-        if (label) label.style.bottom = (ph + 22) + "px";
+        if (label) {
+            label.style.display = pw > 40 ? "" : "none";
+            label.style.bottom = (ph + 22) + "px";
+        }
     };
     inst.ro = new ResizeObserver(resize);
     inst.ro.observe(wrap);
@@ -428,10 +454,10 @@ function open(key, container, plot, palette, onCommit) {
     const render = () => {
         if (inst.dead || !inst.container.isConnected) { dispose(inst); return; }
         controls.update();
-        // 机位预览相机实时跟随 plot.camera
+        // 机位预览相机实时跟随 plot.camera（可在右上角按钮关闭）
         const cam = inst.plot.camera;
         const w = inst.viewW || 1, h = inst.viewH || 1;
-        const pw = Math.round(w * 0.38), ph = Math.round(pw * 9 / 16);
+        const [pw, ph] = pvWH();
         if (cam && typeof cam.x === "number") {
             pvCam.fov = cam.fov || 55;
             pvCam.updateProjectionMatrix();
