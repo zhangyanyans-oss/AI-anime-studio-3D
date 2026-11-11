@@ -7,13 +7,14 @@ import base64
 import uuid
 import shutil
 import asyncio
+import contextvars
 import zipfile
 from urllib.parse import quote
 from pathlib import Path
 from typing import List, Dict, Any
-from fastapi import FastAPI, HTTPException, Query, File, UploadFile
+from fastapi import FastAPI, HTTPException, Query, File, UploadFile, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import Response
+from fastapi.responses import Response, JSONResponse, FileResponse
 from pydantic import BaseModel
 from openai import OpenAI
 import httpx
@@ -50,11 +51,43 @@ load_dotenv(os.path.join(os.getcwd(), ".env"))
 
 app = FastAPI(title="AI Anime Studio")
 
+# ---------- 访问口令（手机版云部署，多口令分区） ----------
+# 线上通过 WorkBuddy 分享链接（sharecode）做第一道门，应用内再用口令保护数据。
+# 主口令 = 管理员（能看到所有分区的全部项目，可管理任何人的）；
+# 分区口令 = 各自独立空间，只能看到自己建的项目。
+# 可在 .env 里配 ACCESS_CODE=xxxx 覆盖主口令；PARTITION_CODES=口令:名称,口令:名称 覆盖分区。
+ACCESS_CODE = (os.getenv("ACCESS_CODE") or "114881").strip()
+MAIN_CODE = ACCESS_CODE  # 主口令 / 管理员
+
+def _load_partition_codes() -> Dict[str, str]:
+    """分区口令表 {口令: 分区名}。默认：朋友A、朋友B 两个分区。"""
+    raw = (os.getenv("PARTITION_CODES") or "").strip()
+    if raw:
+        out = {}
+        for pair in raw.split(","):
+            pair = pair.strip()
+            if ":" in pair:
+                c, name = pair.split(":", 1)
+                if c.strip():
+                    out[c.strip()] = name.strip() or "分区"
+        if out:
+            return out
+    return {"697998": "朋友A分区", "222598": "朋友B分区"}
+
+PARTITION_CODES = _load_partition_codes()
+# 全部有效口令 → 身份（admin / 分区名）
+ACCESS_CODES: Dict[str, str] = {MAIN_CODE: "admin", **PARTITION_CODES}
+
+# 项目数据目录：每个项目一个 JSON 文件（data/projects/{pid}.json），沙箱重启不丢
+PROJECTS_DIR = os.path.join("data", "projects")
+
 # 确保图片目录存在（uploads 为持久目录，不会被自动清理；temp 仅供临时用途）
 if not os.path.exists("static/temp"):
     os.makedirs("static/temp")
 if not os.path.exists("static/uploads"):
     os.makedirs("static/uploads")
+if not os.path.exists(os.path.join("files", "diagrams")):
+    os.makedirs(os.path.join("files", "diagrams"), exist_ok=True)
 
 # ---------- 初始化客户端 ----------
 # 注意：key 缺失时用占位符，保证程序能启动（OpenAI 客户端传 None 会直接抛异常）；
@@ -66,11 +99,68 @@ deepseek_client = OpenAI(
 
 DOUBAO_API_KEY = os.getenv("ARK_API_KEY")
 
+# ---------- 多用户分区密钥：每个口令账户可绑定自己的 API Key ----------
+# 中间件把当前登录口令写入 contextvar，生成请求在深层函数里也能取到当前用户；
+# 分区用户未自定义的项回落到全局密钥（管理员设置的那套）。
+CURRENT_USER: contextvars.ContextVar = contextvars.ContextVar("current_user", default=None)
+USER_KEYS_DIR = os.path.join("data", "user_keys")
+
+def _user_keys_path(code: str) -> str:
+    return os.path.join(USER_KEYS_DIR, f"{code}.json")
+
+def _load_user_keys(code) -> dict:
+    """读取某口令账户的自定义密钥（只存 DeepSeek / ARK / AutoDL 三类）。"""
+    if not code:
+        return {}
+    try:
+        with open(_user_keys_path(code), encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+def _save_user_keys(code: str, keys: dict):
+    os.makedirs(USER_KEYS_DIR, exist_ok=True)
+    with open(_user_keys_path(code), "w", encoding="utf-8") as f:
+        json.dump(keys, f, ensure_ascii=False, indent=1)
+
+def _get_deepseek():
+    """当前用户的 DeepSeek 客户端：分区自定义 > 全局。"""
+    code = CURRENT_USER.get()
+    if code:
+        k = _load_user_keys(code).get("deepseek_api_key")
+        if k:
+            c = _DS_USER_CLIENTS.get((code, k))
+            if c is None:
+                c = _DS_USER_CLIENTS[(code, k)] = OpenAI(api_key=k, base_url="https://api.deepseek.com")
+            return c
+    return deepseek_client
+
+_DS_USER_CLIENTS: Dict[tuple, OpenAI] = {}
+
+def _get_ark_key():
+    """当前用户生效的 ARK 生图密钥：分区自定义 > 全局。"""
+    code = CURRENT_USER.get()
+    if code:
+        k = _load_user_keys(code).get("ark_api_key")
+        if k:
+            return k
+    return DOUBAO_API_KEY
+
+def _get_autodl_token():
+    """当前用户生效的 AutoDL 令牌：分区自定义 > 全局。"""
+    code = CURRENT_USER.get()
+    if code:
+        k = _load_user_keys(code).get("autodl_token")
+        if k:
+            return k
+    return AUTODL_TOKEN
+
+
 def deepseek_friendly_error(e: Exception) -> str:
     """把 DeepSeek 调用异常翻译成可操作的人话（方便在别人机器上排查）。"""
     raw = str(e)
     low = raw.lower()
-    if getattr(deepseek_client, "api_key", "") in ("not-configured", None, ""):
+    if getattr(_get_deepseek(), "api_key", "") in ("not-configured", None, ""):
         return ("未配置 DeepSeek API Key，无法生成剧本/头脑风暴。请在程序(exe)同目录创建 .env 文件，"
                 "写入一行：DEEPSEEK_API_KEY=sk-你的key；或打开页面右上角 ⚙️ API 设置直接粘贴 Key 并保存。")
     if "401" in raw or "authentication" in low or ("invalid" in low and "key" in low):
@@ -200,7 +290,7 @@ BRAINSTORM_SYSTEM_PROMPT = """你是一个专业的动画编剧与头脑风暴�
 
 @app.post("/api/brainstorm")
 async def brainstorm(req: BrainstormRequest):
-    if getattr(deepseek_client, "api_key", "") in ("not-configured", None, ""):
+    if getattr(_get_deepseek(), "api_key", "") in ("not-configured", None, ""):
         raise HTTPException(400, "未配置 DeepSeek API Key。请在程序(exe)同目录创建 .env 文件写入 DEEPSEEK_API_KEY=sk-你的key，"
                                  "或打开页面右上角 ⚙️ API 设置粘贴 Key 并保存后重试。")
     messages = [{"role": "system", "content": BRAINSTORM_SYSTEM_PROMPT}]
@@ -226,7 +316,7 @@ async def brainstorm(req: BrainstormRequest):
             messages.append({"role": "user", "content": content})
 
     try:
-        response = deepseek_client.chat.completions.create(
+        response = _get_deepseek().chat.completions.create(
             model="deepseek-chat",
             messages=messages,
             max_tokens=1024,
@@ -291,7 +381,7 @@ STORY_SYSTEM_PROMPT = """你是一位资深的 AI 动画短片导演兼提示词
 
 @app.post("/api/generate-story")
 async def generate_story(req: StoryRequest):
-    if getattr(deepseek_client, "api_key", "") in ("not-configured", None, ""):
+    if getattr(_get_deepseek(), "api_key", "") in ("not-configured", None, ""):
         raise HTTPException(400, "未配置 DeepSeek API Key。请在程序(exe)同目录创建 .env 文件写入 DEEPSEEK_API_KEY=sk-你的key，"
                                  "或打开页面右上角 ⚙️ API 设置粘贴 Key 并保存后重试。")
     try:
@@ -321,7 +411,7 @@ async def generate_story(req: StoryRequest):
 
         last_err = "未知错误"
         for attempt in range(2):  # 解析失败自动重试 1 次
-            response = deepseek_client.chat.completions.create(
+            response = _get_deepseek().chat.completions.create(
                 model="deepseek-chat",
                 messages=[
                     {"role": "system", "content": STORY_SYSTEM_PROMPT},
@@ -376,7 +466,7 @@ REGEN_SYSTEM_PROMPT = """你是 AI 动画工作台的提示词重写引擎，负
 
 @app.post("/api/regenerate-prompt")
 async def regenerate_prompt(req: RegeneratePromptRequest):
-    if getattr(deepseek_client, "api_key", "") in ("not-configured", None, ""):
+    if getattr(_get_deepseek(), "api_key", "") in ("not-configured", None, ""):
         raise HTTPException(400, "未配置 DeepSeek API Key，无法重新生成提示词。")
     t = (req.type or "").lower()
     if t not in ("character", "scene", "prop", "storyboard"):
@@ -411,7 +501,7 @@ async def regenerate_prompt(req: RegeneratePromptRequest):
         user_lines.append(f"用户的新要求（最高优先级，必须落实）：{req.feedback}")
 
     try:
-        response = deepseek_client.chat.completions.create(
+        response = _get_deepseek().chat.completions.create(
             model="deepseek-chat",
             messages=[
                 {"role": "system", "content": REGEN_SYSTEM_PROMPT},
@@ -523,7 +613,7 @@ async def diagram_prompt(req: TopViewRequest):
         user_lines.append(f"用户的新要求（最高优先级）：{req.feedback}")
 
     try:
-        response = deepseek_client.chat.completions.create(
+        response = _get_deepseek().chat.completions.create(
             model="deepseek-chat",
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -796,6 +886,18 @@ def _normalize_plot(plot: dict) -> dict:
         "path": cam_path,
         "movement": str(cam.get("movement") or "固定机位")[:10],
     }
+    # 手机版 3D 导演台新增的机位高度/镜头俯仰：拖拽/滑条提交后必须原样保留，
+    # 否则每次重绘都会把用户调好的高度与俯角重置回默认（v12 修复）
+    if cam.get("height") is not None:
+        try:
+            camera["height"] = min(4.0, max(0.2, float(cam["height"])))
+        except (TypeError, ValueError):
+            pass
+    if cam.get("pitch") is not None:
+        try:
+            camera["pitch"] = min(60.0, max(-60.0, float(cam["pitch"])))
+        except (TypeError, ValueError):
+            pass
     return {"props": props, "characters": characters, "camera": camera,
             "note": str(plot.get("note") or "")[:80]}
 
@@ -1131,7 +1233,7 @@ async def synthesize_shot_brief(plot: dict, scene_desc: str, dynamic: bool) -> d
     import hashlib
     if not isinstance(plot, dict) or not [c for c in (plot.get("characters") or []) if str(c.get("name") or "").strip()]:
         return None
-    if getattr(deepseek_client, "api_key", "") in ("not-configured", None, ""):
+    if getattr(_get_deepseek(), "api_key", "") in ("not-configured", None, ""):
         return None
     try:
         key = hashlib.sha1(json.dumps(
@@ -1173,7 +1275,7 @@ async def synthesize_shot_brief(plot: dict, scene_desc: str, dynamic: bool) -> d
     ]
     try:
         response = await asyncio.to_thread(
-            deepseek_client.chat.completions.create,
+            _get_deepseek().chat.completions.create,
             model="deepseek-chat", messages=messages, temperature=0.2, max_tokens=1500)
         data = deepseek_json(response)
         brief = _validate_shot_brief(data, facts, dynamic)
@@ -1595,7 +1697,7 @@ async def render_diagram(req: TopViewRequest):
 
     plot, source = None, "ai"
     try:
-        response = deepseek_client.chat.completions.create(
+        response = _get_deepseek().chat.completions.create(
             model="deepseek-chat",
             messages=[
                 {"role": "system", "content": DIAGRAM_PLOT_PROMPT},
@@ -1625,14 +1727,14 @@ async def render_diagram(req: TopViewRequest):
     plot = _stop_unmentioned(plot, lens_txt)
     plot = _normalize_plot(plot)
     png = render_diagram_png(plot, kind)
-    os.makedirs("static/uploads", exist_ok=True)
-    fname = f"diagram_{kind}_{uuid.uuid4().hex[:10]}.png"
-    with open(os.path.join("static", "uploads", fname), "wb") as f:
+    os.makedirs(os.path.join("files", "diagrams"), exist_ok=True)
+    fname = f"dg_{uuid.uuid4().hex[:12]}.png"
+    with open(os.path.join("files", "diagrams", fname), "wb") as f:
         f.write(png)
     log_prompt(f"调度图纸绘制({kind})", json.dumps(plot, ensure_ascii=False)[:500])
     cam_summary = _camera_view_summary(plot)
     log_prompt(f"机位视野计算({kind})", cam_summary)
-    return {"image_url": f"/static/uploads/{fname}", "plot": plot, "cam_summary": cam_summary, "source": source}
+    return {"image_url": f"/files/diagrams/{fname}", "plot": plot, "cam_summary": cam_summary, "source": source}
 
 # ---------- 2.62 手动移机位：导演在图上标注/拖动机位后，把 plot.camera 真正移过去并重绘图纸（消除双机位） ----------
 class MoveCameraRequest(BaseModel):
@@ -1653,14 +1755,14 @@ async def move_camera(req: MoveCameraRequest):
         plot["camera"]["movement"] = "固定机位"
         plot["camera"]["path"] = []
     png = render_diagram_png(plot, "topview")
-    os.makedirs("static/uploads", exist_ok=True)
-    fname = f"diagram_topview_{uuid.uuid4().hex[:10]}.png"
-    with open(os.path.join("static", "uploads", fname), "wb") as f:
+    os.makedirs(os.path.join("files", "diagrams"), exist_ok=True)
+    fname = f"dg_{uuid.uuid4().hex[:12]}.png"
+    with open(os.path.join("files", "diagrams", fname), "wb") as f:
         f.write(png)
     cam_summary = _camera_view_summary(plot)
     log_prompt("手动移机位", json.dumps(plot.get("camera"), ensure_ascii=False)[:200])
     log_prompt("机位视野计算(移机位后)", cam_summary)
-    return {"image_url": f"/static/uploads/{fname}", "plot": plot, "cam_summary": cam_summary}
+    return {"image_url": f"/files/diagrams/{fname}", "plot": plot, "cam_summary": cam_summary}
 
 # ---------- 2.63 拖拽编辑：导演在图上直接拖动角色/轨迹拐点/陈设/机位，前端把新坐标发回重绘 ----------
 class RerenderDiagramRequest(BaseModel):
@@ -1676,15 +1778,15 @@ async def rerender_diagram(req: RerenderDiagramRequest):
     plot = _normalize_plot(req.plot or {})
     png = render_diagram_png(plot, kind)
     os.makedirs("static/uploads", exist_ok=True)
-    fname = f"diagram_{kind}_{uuid.uuid4().hex[:10]}.png"
-    with open(os.path.join("static", "uploads", fname), "wb") as f:
+    fname = f"dg_{uuid.uuid4().hex[:12]}.png"
+    with open(os.path.join("files", "diagrams", fname), "wb") as f:
         f.write(png)
     cam_summary = _camera_view_summary(plot)
     log_prompt(f"拖拽重绘({kind})", json.dumps(
         {"characters": [(c.get("name"), round(float(c.get("x") or 0), 3), round(float(c.get("y") or 0), 3)) for c in plot.get("characters") or []],
          "camera": [plot.get("camera", {}).get("x"), plot.get("camera", {}).get("y")]},
         ensure_ascii=False)[:300])
-    return {"image_url": f"/static/uploads/{fname}", "plot": plot, "cam_summary": cam_summary}
+    return {"image_url": f"/files/diagrams/{fname}", "plot": plot, "cam_summary": cam_summary}
 
 # ---------- 2.65 调度纵深解读：把俯视口述换算成"人物近/中/远景层次"说明（供分镜图理解远近关系） ----------
 class StagingBriefRequest(BaseModel):
@@ -1740,7 +1842,7 @@ async def staging_brief(req: StagingBriefRequest):
         if chars:
             user_lines.append(f"出场人物：{chars}")
     try:
-        response = deepseek_client.chat.completions.create(
+        response = _get_deepseek().chat.completions.create(
             model="deepseek-chat",
             messages=[
                 {"role": "system", "content": STAGING_SYSTEM_PROMPT},
@@ -1775,9 +1877,9 @@ async def extract_au(req: ExtractAURequest):
         return result
 
     # 第二层：词库没命中 → DeepSeek 兜底智能映射（拿 AU 速查表当对照依据）
-    if getattr(deepseek_client, "api_key", "") not in ("not-configured", None, ""):
+    if getattr(_get_deepseek(), "api_key", "") not in ("not-configured", None, ""):
         try:
-            response = deepseek_client.chat.completions.create(
+            response = _get_deepseek().chat.completions.create(
                 model="deepseek-chat",
                 messages=[
                     {"role": "system", "content": (
@@ -1873,7 +1975,7 @@ def select_relevant_references(pool: list[str], meta: list[Dict[str, Any]] | Non
                 "description": str(m.get("description") or "")[:80],
             })
         if candidates and budget > 0:
-            response = deepseek_client.chat.completions.create(
+            response = _get_deepseek().chat.completions.create(
                 model="deepseek-chat",
                 messages=[
                     {"role": "system", "content": (
@@ -2013,10 +2115,10 @@ async def generate_image(req: ImageRequest):
                 m = metas[i] if i < len(metas) else {}
                 kind = str(m.get("kind") or "")
                 name = str(m.get("name") or "").strip()
-                if empty_shot and kind in ("character", "prop"):
+                if empty_shot and kind in ("character", "prop", "face"):
                     removed.append(f"{name or kind}（空镜）")
                     continue
-                if kind == "character" and allowed is not None and name and name not in allowed:
+                if kind in ("character", "face") and allowed is not None and name and name not in allowed:
                     removed.append(name)
                     continue
                 f_pool.append(pool[i]); f_meta.append(m)
@@ -2125,13 +2227,71 @@ async def generate_image(req: ImageRequest):
                 "【角色外貌锚点（权威基准）】以下是导演在角色卡上最终确定的各角色外貌（可能已修改过，"
                 "其他来源与此矛盾的旧外貌描述一律作废）：\n" + "\n".join(anchor_lines)
                 + "\n画面中人物的长相、性别、发型发色、体格必须严格照锚点绘制；"
-                "仅当本条分镜提示词中明确写了与锚点不同的服装或造型（剧情需要换装）时，该处按分镜提示词执行，其余外貌特征仍按锚点。\n"
+                "服装款式与颜色以锚点和该角色的设定图为准——分镜提示词中对服装的一般性描写若与设定图/锚点冲突，"
+                "一律以设定图/锚点为准；仅当分镜提示词明确写出换装剧情（如「换上了礼服」「脱掉外套」「穿上雨衣」）时，"
+                "才按提示词的服装绘制。同一角色在全片所有分镜中的服装必须保持一致，不得镜头之间悄悄变装。\n"
             )
             payload["prompt"] = payload["prompt"] + "\n\n" + anchor_txt
             log_prompt("角色外貌锚点注入", "\n".join(anchor_lines), "")
 
+        # 真人脸参考锁定（v14 融脸修复）：kind=face 的参考图是用户上传的真人照片。
+        # 不注入说明的话，生图模型只把照片当"画风/氛围参考"，画出来的人完全不像——
+        # 必须明确告诉模型"照片里的人就是这个角色的本人"，脸部特征要逐一还原。
+        by_name: Dict[str, list] = {}
+        for pos, i in enumerate(picked):
+            m = metas[i] if i < len(metas) else {}
+            if str(m.get("kind") or "") != "face":
+                continue
+            n = str(m.get("name") or "").strip() or "角色"
+            by_name.setdefault(n, []).append(pos + 1)   # 1-based：第几张参考图
+        if by_name:
+            parts = []
+            for n, poss in by_name.items():
+                loc = "、".join(f"第{p}张" for p in poss)
+                parts.append(f"▸角色「{n}」＝{loc}参考照片")
+            face_txt = (
+                "【真人脸参考锁定（最高优先级）】以下参考照片中的人物就是对应角色的「本人」：\n"
+                + "\n".join(parts)
+                + "\n画面中这些角色的面部必须与照片高度一致——脸型轮廓、五官（眼型、眉形、鼻型、嘴型、耳朵）、"
+                "五官比例与间距、肤色肤质逐一还原，达到「一眼认出是同一个人」的程度；"
+                "同一角色的多张照片是其不同角度，综合取面部特征。\n"
+                "服装与发型发色必须与该角色的设定图保持一致（设定图也在参考图中，见下方【服装一致性锁定】）；"
+                "仅当分镜提示词明确写出换装剧情（如「换上了礼服」「脱掉外套」）时才按提示词的服装绘制。"
+                "画风按全片统一画风，但面部辨识度不得改变——"
+                "严禁画成与照片无关的泛用脸/动画模板脸；照片长相与文字描述冲突时，以照片为准。\n"
+            )
+            payload["prompt"] = payload["prompt"] + "\n\n" + face_txt
+            log_prompt("真人脸锁定注入", "\n".join(parts), "")
+
+        # 服装一致性锁定（v21）：kind=character 的设定图是该角色服装/发型的权威基准。
+        # 不注入的话，模型把设定图只当"人物长相参考"，服装按各镜头提示词随意发挥，
+        # 导致同一角色跨镜头衣服颜色/款式不一致。
+        by_outfit: Dict[str, list] = {}
+        for pos, i in enumerate(picked):
+            m = metas[i] if i < len(metas) else {}
+            if str(m.get("kind") or "") != "character":
+                continue
+            n = str(m.get("name") or "").strip()
+            if n:
+                by_outfit.setdefault(n, []).append(pos + 1)   # 1-based：第几张参考图
+        if by_outfit:
+            oparts = []
+            for n, poss in by_outfit.items():
+                loc = "、".join(f"第{p}张" for p in poss)
+                oparts.append(f"▸角色「{n}」＝{loc}（设定图）")
+            outfit_txt = (
+                "【服装一致性锁定（最高优先级）】以下参考图是对应角色的官方设定图：\n"
+                + "\n".join(oparts)
+                + "\n画面中这些角色的服装（款式、颜色、花纹、层次）、发型发色、标志性配饰"
+                "必须与设定图完全一致，同一角色在本片所有分镜中服装保持统一；"
+                "分镜提示词中对服装的一般性描写若与设定图冲突，以设定图为准；"
+                "仅当提示词明确写出换装剧情（如「换上了礼服」「脱掉外套」「穿上雨衣」）时，才按提示词绘制该镜服装。\n"
+            )
+            payload["prompt"] = payload["prompt"] + "\n\n" + outfit_txt
+            log_prompt("服装一致性锁定注入", "\n".join(oparts), "")
+
     headers = {
-        "Authorization": f"Bearer {DOUBAO_API_KEY}",
+        "Authorization": f"Bearer {_get_ark_key()}",
         "Content-Type": "application/json",
     }
     
@@ -2273,11 +2433,11 @@ async def check_conflicts(req: CheckConflictsRequest):
             lines.append("- " + "｜".join(parts))
 
     ai_note = ""
-    if getattr(deepseek_client, "api_key", "") in ("not-configured", None, ""):
+    if getattr(_get_deepseek(), "api_key", "") in ("not-configured", None, ""):
         ai_note = "未配置 DeepSeek Key，仅完成程序检查（名单外角色/同名/缺参考图）。"
     else:
         try:
-            response = deepseek_client.chat.completions.create(
+            response = _get_deepseek().chat.completions.create(
                 model="deepseek-chat",
                 messages=[
                     {"role": "system", "content": CONFLICT_CHECK_PROMPT},
@@ -2336,7 +2496,7 @@ class AnalyzeRefImageRequest(BaseModel):
 @app.post("/api/analyze-ref-image")
 async def analyze_ref_image(req: AnalyzeRefImageRequest):
     """识图提取：从上传的参考图反推文字描述与生图提示词。"""
-    if getattr(deepseek_client, "api_key", "") in ("not-configured", None, ""):
+    if getattr(_get_deepseek(), "api_key", "") in ("not-configured", None, ""):
         raise HTTPException(400, "未配置 DeepSeek API Key，无法识图。请到 ⚙️ API 设置填写。")
     b64 = (req.image_base64 or "").strip()
     if b64.startswith("data:"):
@@ -2372,7 +2532,7 @@ async def analyze_ref_image(req: AnalyzeRefImageRequest):
     name_line = (f"该{type_label}的名字是「{(req.name or '').strip()}」，仅作参考，不要把名字本身写进描述。"
                  if (req.name or "").strip() else "")
     try:
-        response = deepseek_client.chat.completions.create(
+        response = _get_deepseek().chat.completions.create(
             model="deepseek-chat",
             messages=[{"role": "user", "content": [
                 {"type": "text", "text": (
@@ -2646,7 +2806,7 @@ async def generate_video(req: VideoRequest):
     # 首尾帧应用(U02)可能使用独立令牌：配置了 AUTODL_I2V_TOKEN 且非参考模式时用它
     use_i2v_token = frame_mode != "reference" and AUTODL_I2V_TOKEN.strip()
     headers = {
-        "Authorization": (AUTODL_I2V_TOKEN.strip() if use_i2v_token else AUTODL_TOKEN),
+        "Authorization": (AUTODL_I2V_TOKEN.strip() if use_i2v_token else _get_autodl_token()),
         "Content-Type": "application/json",
     }
     if use_i2v_token:
@@ -2787,7 +2947,7 @@ async def generate_video(req: VideoRequest):
 # ---------- 5. AutoDL 查询视频结果 ----------
 @app.get("/api/video-status/{task_id}")
 async def video_status(task_id: str):
-    headers = {"Authorization": AUTODL_TOKEN}
+    headers = {"Authorization": _get_autodl_token()}
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(
@@ -2825,7 +2985,7 @@ class SaveVideoRequest(BaseModel):
 @app.post("/api/save-video")
 async def save_video(req: SaveVideoRequest):
     """把云端生成完成的视频下载到本地持久保存（AutoDL 返回的签名链接会过期）。"""
-    headers = {"Authorization": AUTODL_TOKEN}
+    headers = {"Authorization": _get_autodl_token()}
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.get(
             f"{AUTODL_BASE}/api/v1/comfyui/comfyui_workflow/result/{req.task_id}",
@@ -2984,32 +3144,60 @@ def _mask_secret(v: str) -> str:
 @app.get("/api/settings")
 async def get_settings():
     # 安全：API Key / Token 只返回脱敏摘要，永不明文传给前端；更换时在输入框填新值即可
+    # 分区账户：返回「自己生效的密钥」（自定义 > 全局回退），并标记哪些是自定义的
+    code = CURRENT_USER.get()
+    uk = _load_user_keys(code)
     return {
-        "deepseek_api_key": _mask_secret(os.getenv("DEEPSEEK_API_KEY", "")),
-        "ark_api_key": _mask_secret(os.getenv("ARK_API_KEY", "")),
+        "deepseek_api_key": _mask_secret(uk.get("deepseek_api_key") or os.getenv("DEEPSEEK_API_KEY", "")),
+        "ark_api_key": _mask_secret(uk.get("ark_api_key") or os.getenv("ARK_API_KEY", "")),
         "doubao_model": DOUBAO_MODEL,
         "doubao_base": DOUBAO_BASE,
-        "autodl_token": _mask_secret(AUTODL_TOKEN),
+        "autodl_token": _mask_secret(uk.get("autodl_token") or AUTODL_TOKEN),
         "autodl_i2v_token": _mask_secret(AUTODL_I2V_TOKEN),
         "autodl_workflow_id": AUTODL_WORKFLOW,
         "autodl_base": AUTODL_BASE,
+        "custom": {
+            "deepseek": bool(uk.get("deepseek_api_key")),
+            "ark": bool(uk.get("ark_api_key")),
+            "autodl": bool(uk.get("autodl_token")),
+        },
+        "is_admin": code == MAIN_CODE,
     }
 
 @app.post("/api/settings")
 async def update_settings(req: SettingsRequest):
     global DOUBAO_MODEL, DOUBAO_BASE, AUTODL_TOKEN, AUTODL_I2V_TOKEN, AUTODL_WORKFLOW, AUTODL_BASE, deepseek_client
+    global DOUBAO_API_KEY
     updates = {}
 
     def set_env(env_key: str, value: str):
         updates[env_key] = value
         os.environ[env_key] = value
 
+    # 分区账户：密钥存到自己名下（data/user_keys/{code}.json），只影响本账户；
+    # 全局级设置（模型名/服务地址/工作流）仅管理员可改，分区用户传了也忽略
+    code = CURRENT_USER.get()
+    if code and code != MAIN_CODE:
+        uk = _load_user_keys(code)
+        changed = []
+        for field in ("deepseek_api_key", "ark_api_key", "autodl_token"):
+            v = getattr(req, field, None)
+            if v is not None and v.strip():
+                uk[field] = v.strip()
+                changed.append(field)
+        if changed:
+            _save_user_keys(code, uk)
+            print(f"⚙️ 分区账户 {code} 更新了自定义密钥: {changed}")
+        return {"saved": True, "updated": changed, "scope": "user"}
+
     if req.deepseek_api_key is not None and req.deepseek_api_key.strip():
         key = req.deepseek_api_key.strip()
         set_env("DEEPSEEK_API_KEY", key)
         deepseek_client = OpenAI(api_key=key, base_url="https://api.deepseek.com")
     if req.ark_api_key is not None and req.ark_api_key.strip():
-        set_env("ARK_API_KEY", req.ark_api_key.strip())
+        # 立即生效：DOUBAO_API_KEY 是生图请求头的运行时全局变量，只写 .env 要重启才生效
+        DOUBAO_API_KEY = req.ark_api_key.strip()
+        set_env("ARK_API_KEY", DOUBAO_API_KEY)
     if req.doubao_model is not None and req.doubao_model.strip():
         DOUBAO_MODEL = req.doubao_model.strip()
         set_env("DOUBAO_MODEL", DOUBAO_MODEL)
@@ -3107,6 +3295,163 @@ async def import_project(file: UploadFile = File(...)):
     print(f"📥 导入项目「{project.get('name', '')}」：恢复媒体文件 {restored} 个")
     return {"project": project, "restored_files": restored}
 
+# ---------- 手机版：访问口令校验（/api/* 除登录外一律校验 x-access-code 头，多口令分区） ----------
+@app.middleware("http")
+async def access_code_guard(request, call_next):
+    path = request.url.path
+    if path.startswith("/api/") and path != "/api/login":
+        code = (request.headers.get("x-access-code") or "").strip()
+        if code not in ACCESS_CODES:
+            return JSONResponse({"detail": "需要访问口令"}, status_code=401)
+        request.state.user = code  # 当前登录口令（分区身份）
+        CURRENT_USER.set(code)
+    return await call_next(request)
+
+def _current_user(request: Request) -> str:
+    return getattr(request.state, "user", "") or MAIN_CODE
+
+def _is_admin(request: Request) -> bool:
+    return _current_user(request) == MAIN_CODE
+
+class LoginRequest(BaseModel):
+    code: str
+
+@app.post("/api/login")
+async def login(req: LoginRequest):
+    """手机版登录：校验访问口令（主口令=管理员，分区口令=独立空间）。
+    通过后前端把口令存 localStorage，后续请求带 x-access-code 头。"""
+    code = (req.code or "").strip()
+    if code not in ACCESS_CODES:
+        raise HTTPException(401, "口令不正确，请重试")
+    return {"ok": True, "role": "admin" if code == MAIN_CODE else "partition",
+            "zone": "主口令（管理员）" if code == MAIN_CODE else ACCESS_CODES[code]}
+
+# ---------- 手机版：项目云端存储（数据保存在沙箱 data/projects/*.json，换手机不丢） ----------
+# 分区规则：项目归属创建它的口令（owner 字段）。管理员看全部、可管理任何人的；
+# 分区口令只看到 owner=自己 的项目，且只能改/删自己的。旧数据无 owner 视为管理员所有。
+def _project_path(pid: str) -> str:
+    if not re.fullmatch(r"p[0-9a-f]{8,20}", pid or ""):
+        raise HTTPException(400, "非法项目 ID")
+    return os.path.join(PROJECTS_DIR, f"{pid}.json")
+
+def _load_project(pid: str) -> dict:
+    p = _project_path(pid)
+    if not os.path.isfile(p):
+        raise HTTPException(404, "项目不存在")
+    with open(p, encoding="utf-8") as f:
+        return json.load(f)
+
+def _save_project(doc: dict) -> None:
+    os.makedirs(PROJECTS_DIR, exist_ok=True)
+    doc["updated_at"] = int(doc.get("updated_at") or 0)
+    with open(_project_path(doc["id"]), "w", encoding="utf-8") as f:
+        json.dump(doc, f, ensure_ascii=False)
+
+class ProjectCreateRequest(BaseModel):
+    name: str = "未命名项目"
+    data: Dict[str, Any] = {}
+
+def _owner_of(doc: dict) -> str:
+    """项目归属口令；旧数据（无 owner 字段）视为管理员所有。"""
+    return doc.get("owner") or MAIN_CODE
+
+def _can_access(request: Request, doc: dict) -> bool:
+    return _is_admin(request) or _owner_of(doc) == _current_user(request)
+
+@app.get("/api/projects")
+async def list_projects(request: Request):
+    """项目列表：{id,name,updated_at,board_count,cover,owner}，按更新时间倒序。
+    管理员看全部项目；分区口令只看到自己创建的项目。"""
+    user = _current_user(request)
+    is_admin = user == MAIN_CODE
+    items = []
+    if os.path.isdir(PROJECTS_DIR):
+        for fn in os.listdir(PROJECTS_DIR):
+            if not fn.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(PROJECTS_DIR, fn), encoding="utf-8") as f:
+                    doc = json.load(f)
+            except Exception:
+                continue
+            if not is_admin and _owner_of(doc) != user:
+                continue  # 分区隔离：不是自己建的项目不可见
+            data = doc.get("data") or {}
+            boards = data.get("boards") or []
+            cover = ""
+            for b in boards:
+                imgs = b.get("images") or []
+                if imgs:
+                    cover = imgs[-1]; break
+                if b.get("topView"):
+                    cover = b["topView"]; break
+            items.append({
+                "id": doc.get("id"), "name": doc.get("name") or "未命名项目",
+                "updated_at": doc.get("updated_at") or 0,
+                "board_count": len(boards), "cover": cover,
+                "owner": _owner_of(doc),
+                "owner_label": "管理员" if _owner_of(doc) == MAIN_CODE else PARTITION_CODES.get(_owner_of(doc), "分区"),
+            })
+    items.sort(key=lambda x: x.get("updated_at") or 0, reverse=True)
+    return {"projects": items}
+
+@app.post("/api/projects")
+async def create_project(req: ProjectCreateRequest, request: Request):
+    pid = "p" + uuid.uuid4().hex[:12]
+    doc = {"id": pid, "name": req.name or "未命名项目", "data": req.data or {},
+           "owner": _current_user(request),  # 归属创建者所在分区
+           "updated_at": int(__import__("time").time() * 1000)}
+    _save_project(doc)
+    return doc
+
+@app.get("/api/projects/{pid}")
+async def get_project(pid: str, request: Request):
+    doc = _load_project(pid)
+    if not _can_access(request, doc):
+        raise HTTPException(403, "无权访问该项目")
+    return doc
+
+@app.post("/api/projects/{pid}")
+async def save_project(pid: str, req: dict, request: Request):
+    doc = _load_project(pid) if os.path.isfile(_project_path(pid)) else {"id": pid}
+    if os.path.isfile(_project_path(pid)) and not _can_access(request, doc):
+        raise HTTPException(403, "无权修改该项目")
+    doc.setdefault("owner", _current_user(request))  # 新建即归属当前分区
+    if isinstance(req.get("name"), str) and req["name"].strip():
+        doc["name"] = req["name"].strip()
+    if isinstance(req.get("data"), dict):
+        doc["data"] = req["data"]
+    doc["updated_at"] = int(__import__("time").time() * 1000)
+    _save_project(doc)
+    return doc
+
+@app.delete("/api/projects/{pid}")
+async def delete_project(pid: str, request: Request):
+    p = _project_path(pid)
+    if os.path.isfile(p):
+        doc = _load_project(pid)
+        if not _can_access(request, doc):
+            raise HTTPException(403, "无权删除该项目")
+        os.remove(p)
+    return {"ok": True}
+
+# ---------- 手机版：生成文件访问（/files/diagrams/*.png 等，WorkBuddy 网关 sharecode 已做第一道防护） ----------
+@app.get("/files/{subpath:path}")
+async def serve_files(subpath: str):
+    root = os.path.abspath("files")
+    target = os.path.abspath(os.path.join(root, subpath))
+    if not target.startswith(root + os.sep) or not os.path.isfile(target):
+        raise HTTPException(404, "not found")
+    return FileResponse(target)
+
+# ---------- 手机版：根路径返回手机版页面（桌面版仍保留在 /static/index.html 备用） ----------
+@app.get("/")
+async def mobile_home():
+    p = os.path.join("static", "mobile_index.html")
+    if os.path.isfile(p):
+        return FileResponse(p, headers={"Cache-Control": "no-store, must-revalidate"})
+    return FileResponse(os.path.join("static", "index.html"), headers={"Cache-Control": "no-store, must-revalidate"})
+
 # ---------- 前端页面响应头：禁止缓存 index.html，避免浏览器用旧页面看不到新功能 ----------
 @app.middleware("http")
 async def no_cache_html(request, call_next):
@@ -3119,11 +3464,11 @@ async def no_cache_html(request, call_next):
     return response
 
 app.mount("/static", StaticFiles(directory="static"), name="assets")
-# 再把根路径映射到前端页面（保持 html=True 以便访问 / 时自动返回 index.html）
-app.mount("/", StaticFiles(directory="static", html=True), name="static")
+# 根路径 "/" 由上方 @app.get("/") 显式返回手机版页面（不再整站挂载到根，避免与 /files、/api 冲突）
 
 if __name__ == "__main__":
     import uvicorn
     # 启动时清理一次旧文件
     clean_temp_files()
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # 云沙箱通过 PORT 环境变量注入端口；本地默认 8000
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))

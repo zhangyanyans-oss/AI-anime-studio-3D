@@ -28,3 +28,7 @@ static/wps-edit.js
 # 测试目录
 test_share/
 share_test/
+
+# 运行时用户数据与生成产物（含项目内容，不上传）
+data/
+files/

@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#4f46e5">
+<title>AI 动画工作台 · 手机版</title>
+<link rel="stylesheet" href="/static/mobile.css?v=8">
+<script type="importmap">
+{
+  "imports": {
+    "three": "/static/vendor/three/three.module.js",
+    "three/addons/controls/OrbitControls.js": "/static/vendor/three/OrbitControls.js"
+  }
+}
+</script>
+<script type="module" src="/static/director3d.js?v=13"></script>
+<script src="/static/vendor/marked.min.js"></script>
+<script src="/static/vendor/purify.min.js"></script>
+</head>
+<body>
+
+<!-- 登录层 -->
+<div id="login-screen" class="fullscreen hidden">
+  <div class="login-box">
+    <div class="login-logo">🎬</div>
+    <h1>AI 动画工作台</h1>
+    <p class="login-sub">手机版 · 输入口令进入</p>
+    <input id="login-code" type="password" inputmode="numeric" placeholder="访问口令" autocomplete="off">
+    <button class="btn btn-primary btn-block" onclick="doLogin()">进入</button>
+    <p id="login-err" class="login-err hidden">口令不正确，请重试</p>
+  </div>
+</div>
+
+<!-- 首页：项目列表 -->
+<div id="home-screen" class="screen hidden">
+  <header class="topbar">
+    <div class="topbar-title">🎬 我的动画项目<span id="zone-badge" class="zone-badge hidden"></span></div>
+    <div style="display:flex;gap:4px;">
+      <button class="icon-btn" onclick="showApiScreen('home')" title="API 密钥设置">⚙️</button>
+      <button class="icon-btn" id="btn-logout" onclick="logoutUser()" title="退出/切换账户">⇄</button>
+      <button class="icon-btn" id="btn-manage" onclick="toggleManage()" title="管理项目">⋯</button>
+    </div>
+  </header>
+  <div class="page">
+    <button class="new-project-card" onclick="showNewProject()">
+      <span class="new-plus">＋</span>
+      <span>新建动画项目</span>
+      <span class="new-hint">点子 → 剧本 → 分镜 → 视频</span>
+    </button>
+    <div id="project-list"></div>
+    <p class="home-foot">数据保存在云端 · 换手机也不丢</p>
+  </div>
+</div>
+
+<!-- API 密钥设置（独立页：首页 / 工作台均可进入） -->
+<div id="api-screen" class="screen hidden">
+  <header class="topbar">
+    <button class="icon-btn" onclick="closeApiScreen()" title="返回">‹</button>
+    <div class="topbar-title">⚙️ API 密钥设置</div>
+    <div style="width:36px;"></div>
+  </header>
+  <div class="page">
+    <div class="card pad">
+      <div class="sec-title">API 密钥 <span class="sec-hint">填自己的 Key，保存后立即生效；分区账户的密钥只对本账户生效，未设置的项自动使用全局密钥；管理员设置的为全局密钥</span></div>
+      <label class="field-label">DeepSeek（剧本 / 头脑风暴）</label>
+      <input id="set-deepseek" type="password" placeholder="sk-..." autocomplete="off">
+      <label class="field-label">火山方舟 ARK（分镜图生成）</label>
+      <input id="set-ark" type="password" placeholder="ark-..." autocomplete="off">
+      <label class="field-label">AutoDL.Art 令牌（视频生成）</label>
+      <input id="set-autodl" type="password" placeholder="ComfyUI 分组令牌" autocomplete="off">
+      <button class="btn btn-primary btn-block" onclick="saveSettings()">保存密钥</button>
+      <div id="settings-masked" class="masked-list"></div>
+    </div>
+    <p class="home-foot">密钥保存在服务器端，前端只显示脱敏摘要，不会明文回传</p>
+  </div>
+</div>
+
+<!-- 工作台 -->
+<div id="studio-screen" class="screen hidden">
+  <header class="topbar studio-topbar">
+    <button class="icon-btn" onclick="backHome()" title="返回">‹</button>
+    <div class="studio-name" id="studio-name">未命名项目</div>
+    <div class="save-state" id="save-state"></div>
+  </header>
+
+  <main id="studio-body">
+    <!-- 故事 -->
+    <section class="tab-page" id="tab-story">
+      <div id="story-create">
+        <div class="welcome-card">
+          <div class="welcome-emoji">🎬</div>
+          <h2>从一个点子开始</h2>
+          <p>写下你脑海中的画面，AI 帮你聊成完整剧本、分镜和成片。</p>
+        </div>
+        <div class="mode-card" onclick="openIdeaInput()">
+          <div class="mode-icon">✍️</div>
+          <div class="mode-text"><b>直接写点子</b><span>一句话，AI 直接生成全片剧本</span></div>
+          <div class="mode-arrow">›</div>
+        </div>
+        <div class="mode-card" onclick="openBrainstorm()">
+          <div class="mode-icon">💬</div>
+          <div class="mode-text"><b>和 AI 头脑风暴</b><span>一步步聊清楚画面、主角、冲突、结局</span></div>
+          <div class="mode-arrow">›</div>
+        </div>
+        <div id="idea-input-wrap" class="hidden">
+          <textarea id="idea-input" rows="4" placeholder="例如：一只加班到深夜的橘猫，幻想自己是大侠…"></textarea>
+          <button class="btn btn-primary btn-block" onclick="genStoryFromIdea()">生成剧本</button>
+        </div>
+      </div>
+
+      <div id="brainstorm-wrap" class="hidden">
+        <div id="chat-list" class="chat-list"></div>
+        <div id="ready-banner" class="ready-banner hidden">
+          故事要素齐了！<button class="btn btn-primary" onclick="genStoryFromChat()">生成剧本 →</button>
+        </div>
+        <div class="chat-input-row">
+          <label class="attach-btn">📷<input id="chat-file" type="file" accept="image/*" capture="environment" hidden onchange="onChatImage(this)"></label>
+          <input id="chat-input" type="text" placeholder="说说你的想法…">
+          <button class="send-btn" id="chat-send" onclick="sendChat()">➤</button>
+        </div>
+      </div>
+
+      <div id="story-view" class="hidden">
+        <div class="hook-card" id="story-hook"></div>
+        <div class="card pad">
+          <div class="sec-title">剧情梗概</div>
+          <p class="synopsis" id="story-synopsis"></p>
+        </div>
+        <div class="card pad">
+          <div class="sec-title">画风圣经 <span class="sec-hint">全片画风统一锁定</span></div>
+          <p class="style-bible" id="story-style"></p>
+        </div>
+        <div class="stat-row" id="story-stats"></div>
+        <button class="btn btn-ghost btn-block" id="btn-brainstorm-toggle" onclick="toggleBrainstorm()">💬 头脑风暴对话（点此展开/收起，可继续和 AI 聊）</button>
+        <button class="btn btn-ghost btn-block" onclick="regenStory()">🔄 重新生成剧本（会覆盖分镜进度）</button>
+      </div>
+    </section>
+
+    <!-- 资产 -->
+    <section class="tab-page hidden" id="tab-assets">
+      <div class="seg" id="asset-seg">
+        <button class="seg-item active" data-k="characters" onclick="setAssetTab('characters')">角色</button>
+        <button class="seg-item" data-k="scenes" onclick="setAssetTab('scenes')">场景</button>
+        <button class="seg-item" data-k="props" onclick="setAssetTab('props')">道具</button>
+      </div>
+      <div id="asset-grid" class="asset-grid"></div>
+    </section>
+
+    <!-- 分镜 -->
+    <section class="tab-page hidden" id="tab-boards">
+      <div class="boards-toolbar">
+        <div class="seg" id="orient-seg">
+          <button class="seg-item active" data-k="portrait" onclick="setOrientation('portrait')">📱 竖屏</button>
+          <button class="seg-item" data-k="landscape" onclick="setOrientation('landscape')">🖥 横屏</button>
+        </div>
+        <button class="btn btn-primary btn-add-board" onclick="addBoardAfter(null)">➕ 新增分镜</button>
+        <div class="toolbar-hint">全片画幅统一：竖屏 1080×1920 / 横屏 1920×1080 · <b>长按镜头卡片或按住左侧 ⠿ 上下拖动排序</b>（也可用 ▲▼ 微调）</div>
+      </div>
+      <div id="board-list"></div>
+    </section>
+
+    <!-- 设置 -->
+    <section class="tab-page hidden" id="tab-settings">
+      <div class="card pad">
+        <div class="sec-title">视频模型 <span class="sec-hint">多图参考＝把分镜图/调度图/角色场景图一起给 AI 作参考；首尾帧＝画面从分镜图出发、最后收回到分镜图</span></div>
+        <select id="set-workflow" onchange="saveVideoWorkflow()">
+          <option value="">默认 · H3升级画质（多图参考 zm_u24）</option>
+          <optgroup label="多图参考 · 上传分镜图/角色/场景图作参考">
+            <option value="minimax_h3_zm_u30">多图参考 · H3超清画质（细节更好，稍慢稍贵）</option>
+            <option value="minimax_h3_zm_u08">多图参考 · H3高速版（最快最省）</option>
+            <option value="minimax_h3_lightx2v_v5">多图参考 · H3标准版（1-10秒）</option>
+            <option value="minimax_h3_lightx2v_v5_15s">多图参考 · H3标准版（最长15秒）</option>
+            <option value="minimax_h3_b99_003_12s">多图参考 · H3（12秒 · 736p）</option>
+            <option value="minimax_h3_z0902">多图参考 · H3六图一致性创作</option>
+          </optgroup>
+          <optgroup label="首尾帧 · 以分镜图为起点和终点">
+            <option value="minimax_h3_lightx2v">首尾帧 · H3首尾帧生成视频</option>
+          </optgroup>
+        </select>
+        <div class="toolbar-hint" style="padding:6px 2px 0;">横竖屏画幅在「分镜」页顶部选择（📱竖屏 / 🖥横屏），全片统一</div>
+      </div>
+      <div class="card pad">
+        <div class="sec-title">API 密钥</div>
+        <button class="btn btn-ghost btn-block" onclick="showApiScreen('studio')">⚙️ 设置 / 更换 API 密钥</button>
+      </div>
+      <div class="card pad">
+        <div class="sec-title">本项目</div>
+        <button class="btn btn-danger btn-block" onclick="deleteCurrentProject()">🗑 删除当前项目</button>
+      </div>
+      <p class="home-foot">AI 动画工作台 · 手机版 v1.1（新版 ✔ 带3D面板开关）</p>
+    </section>
+  </main>
+
+  <nav class="tabbar">
+    <button class="tabbar-item active" data-tab="story" onclick="setTab('story')">
+      <svg viewBox="0 0 24 24"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H19v15.5H6.5A2.5 2.5 0 0 0 4 21V5.5z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M19 18.5H6.5A2.5 2.5 0 0 0 4 21" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M8 8h7M8 11.5h5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+      <span>故事</span>
+    </button>
+    <button class="tabbar-item" data-tab="assets" onclick="setTab('assets')">
+      <svg viewBox="0 0 24 24"><circle cx="9" cy="8.5" r="3.2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M3.5 19c.6-3 2.8-4.8 5.5-4.8s4.9 1.8 5.5 4.8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M15.5 5.6a3.2 3.2 0 0 1 0 5.8M17.5 14.5c1.6.8 2.7 2.3 3 4.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+      <span>角色场景</span>
+    </button>
+    <button class="tabbar-item" data-tab="boards" onclick="setTab('boards')">
+      <svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M3 9h18M9 5v4M15 5v4M9 19v-6M15 19v-6M3 15h18" stroke="currentColor" stroke-width="1.4" opacity=".55"/></svg>
+      <span>分镜</span>
+    </button>
+    <button class="tabbar-item" data-tab="settings" onclick="setTab('settings')">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 2.8v3M12 18.2v3M2.8 12h3M18.2 12h3M5.5 5.5l2.1 2.1M16.4 16.4l2.1 2.1M18.5 5.5l-2.1 2.1M7.6 16.4l-2.1 2.1" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+      <span>设置</span>
+    </button>
+  </nav>
+</div>
+
+<!-- 底部抽屉 -->
+<div id="sheet-mask" class="sheet-mask hidden" onclick="closeSheet(event)"></div>
+<div id="sheet" class="sheet hidden">
+  <button class="sheet-close" onclick="closeSheet()" aria-label="关闭">✕</button>
+  <div class="sheet-scroll"><div id="sheet-body"></div></div>
+</div>
+
+<!-- 图片灯箱 -->
+<div id="lightbox" class="lightbox hidden" onclick="closeLightbox()">
+  <img id="lightbox-img" src="" alt="">
+  <button class="lightbox-close" onclick="closeLightbox()">✕</button>
+</div>
+
+<!-- 3D 导演台全屏层 -->
+<div id="dir3d-overlay" class="fullscreen hidden">
+  <div class="dir3d-topbar">
+    <div class="dir3d-title" id="dir3d-title">🎬 3D 导演台</div>
+    <button class="btn btn-ghost dir3d-close" onclick="closeDirector3D()">✕ 退出</button>
+  </div>
+  <div id="dir3d-container"></div>
+  <div class="dir3d-tip">单指拖人物/机位/红点（松手自动重绘图纸）· 双指旋转/缩放视角 · 拖空白地面不动作</div>
+</div>
+
+<!-- 通用长任务遮罩（生成中不可关闭） -->
+<div id="busy-mask" class="busy-mask hidden">
+  <div class="busy-card">
+    <div class="spinner"></div>
+    <div id="busy-text">生成中…</div>
+    <div id="busy-sub" class="busy-sub"></div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+<input id="ref-file-input" type="file" accept="image/*" multiple hidden onchange="onRefImages(this)">
+
+<script src="/static/app.js?v=25"></script>
+</body>
+</html>
